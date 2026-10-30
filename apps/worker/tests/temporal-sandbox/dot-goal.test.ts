@@ -47,6 +47,7 @@ describe("dotGoalWorkflow on the time-skipping test server", () => {
     ];
     stubs.override("dotGoalStep", (_input, index) => steps[index]);
 
+    const startMs = await env.testEnv.currentTimeMs();
     const handle = await startDotGoal("dot-goal-test-wake", "goal-0002");
     // The signal handler is registered before the first step; wait for the
     // first step so the wake-up is guaranteed to land inside the wait.
@@ -56,6 +57,12 @@ describe("dotGoalWorkflow on the time-skipping test server", () => {
     const result = await handle.result();
     expect(result).toEqual({ goalStatus: "COMPLETED" });
     expect(stubs.count("dotGoalStep")).toBe(2);
+    // currentTimeMs() after result() also jumps by the test server's default
+    // 10-year workflow execution timeout, so it stays above 30s even when the
+    // wake-up fires. The execution close time is the server clock when the
+    // run actually finished, and an ignored signal still waits out 30s.
+    const closeMs = (await handle.describe()).closeTime?.getTime() ?? Number.POSITIVE_INFINITY;
+    expect(closeMs - startMs).toBeLessThan(30_000);
   }, 60000);
 
   it("waits for the full timeout when no wake-up arrives and steps again", async () => {
