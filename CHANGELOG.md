@@ -5,6 +5,8 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+- The launcher can run on rootless Podman 5 with `podman compose` (docker-compose v2). `install --engine podman` saves the engine, and later commands use it. Docker remains the default when it works. Host-root access and in-place engine switches are refused; switch engines through backup, `uninstall --purge-data`, install, and restore. `doctor` and `support-bundle` report rootless mode, cgroup v2, and whether CPU and memory limits are delegated. Backup resumes paused containers with `podman unpause`, because `docker compose unpause` through the Podman API leaves them paused.
+
 ## [1.1.9] - 2026-10-25
 
 Source: sanitized Space app @ 25bcec3e77 (5029 files). 1.1.8 was prepared but never published; its changes are part of

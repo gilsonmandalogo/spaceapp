@@ -3,7 +3,8 @@
 SpaceApp packages its application services and redistributable AI coding CLIs
 in Docker. The host needs Node.js only for the small `spaceapp` launcher,
 and enough resources for the stack. The launcher installs and starts Docker
-automatically when it is missing.
+automatically when it is missing. Podman 5 is supported too, when you pass
+`--engine podman`; the launcher does not install Podman.
 
 ## Requirements
 
@@ -38,6 +39,54 @@ the native `docker` and `docker-compose` packages through `pacman`. It then
 starts the service. Before adding the current user to the `docker` group, it
 explains that the group grants root-level privileges, adds the user
 automatically, and continues in the same command.
+
+### Rootless Podman
+
+Podman is an alternative to Docker on Linux and macOS. It is not supported on
+Windows. Install Podman 5 or newer yourself, and install the docker-compose v2
+provider (`podman compose version` must report Docker Compose 2.x). The Python
+`podman-compose` 1.x package is not supported: this stack needs Compose
+profiles, file secrets, `depends_on` health conditions with `required: false`,
+`init`, CPU and memory limits, and `up --wait`.
+
+```bash
+npx --yes run-spaceapp@latest install --engine podman --profile small
+```
+
+`--engine` is saved in the launcher config and used by later commands. Without
+`--engine`, Docker is used when it works. If Docker is missing and Podman is
+present, the installer offers Podman, and `--non-interactive` selects it.
+The same choice can be passed in `--answers` as `"engine": "podman"`.
+
+On Linux the engine must be rootless and on cgroup v2, with the `cpu` and
+`memory` controllers delegated to the user. `doctor` reports the engine,
+version, rootless or rootful mode, cgroup version, and whether those limits
+can be applied. If a limit cannot be applied, installation stops before `up`.
+`support-bundle` records the same facts and does not include secrets.
+Podman healthchecks are systemd timers. On a Podman build without them
+(the static bundle current GitHub-hosted Ubuntu images ship), the launcher
+runs `podman healthcheck run` while `up` waits for a healthy dependency.
+
+Published images start as root and drop to uid 10001. Rootless Podman maps
+your user to that uid (`keep-id`) and starts the entrypoint as container root
+so the drop still works. Files the agent writes into a workspace bind are
+owned by you. Workspace binds, `./backups`, and `./secrets/providers` use the
+shared SELinux label `z` so they can be read on an enforcing host such as
+Fedora. `workspace add` does not ask for `setfacl` on Podman when the folder
+is already owned by you. Backup runs as uid 10001 so `./backups` stays
+yours, and resumes writers with `podman unpause`:
+`docker compose unpause` through the Podman API reports success and leaves
+containers paused.
+
+`--access host-root` is refused on Podman. Docker volumes are not visible to
+Podman, so changing the engine of an existing installation is refused.
+Migrate with `backup`, then `uninstall --purge-data`, then
+`install --engine podman`, then `restore`.
+
+On a Mac, start a Podman machine with enough CPU, memory, and disk for the
+profile (`podman machine init --cpus 4 --memory 7168 --disk-size 20` is enough
+for `small`). The launcher reads the machine size and prints the
+`podman machine set` command when it is too small. Disk can grow but not shrink.
 
 ## macOS
 
@@ -235,10 +284,11 @@ instructions before allowing tools to operate on it.
 services. Run `npx --yes run-spaceapp@latest up` only if the command says the
 services could not pick it up.
 
-On Linux the CLIs run as uid 10001 inside Docker, and a mounted folder keeps its
+On Linux with Docker the CLIs run as uid 10001, and a mounted folder keeps its
 host owner. When they cannot write to it, `workspace add` prints the command that
 gives them access without changing the owner (install the `acl` package if
-`setfacl` is missing):
+`setfacl` is missing). Rootless Podman already maps uid 10001 to your user, so
+that ACL is not required when the folder is owned by you:
 
 ```bash
 sudo setfacl -R -m u:10001:rwX -m u:$(id -u):rwX -m d:u:10001:rwX -m d:u:$(id -u):rwX /home/alice/code/example

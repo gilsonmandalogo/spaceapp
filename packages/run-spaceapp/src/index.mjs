@@ -20,6 +20,16 @@ import {
 import { UNIVERSAL_COMMAND } from "./package-info.mjs";
 import { imageVerificationOff, verifyLockedImages } from "./image-attestations.mjs";
 import { IMAGE_TARGETS, imageDigestEnv, PACKAGE_IMAGE_LOCK, parseRecordedDigests } from "./image-lock.mjs";
+import {
+  PODMAN_APP_USER,
+  PODMAN_KEEP_ID,
+  assertContainerEngine,
+  configEngine,
+  engineSwitchMessage,
+  hostRootOnPodmanMessage,
+  renderPodmanRuntimeCompose,
+  selinuxBindLines
+} from "./engine.mjs";
 
 const CONFIG_SCHEMA_VERSION = 4;
 const CONTAINER_SECRET_MODE = 0o644;
@@ -132,7 +142,8 @@ const CONFIG_KEYS = new Set([
   "companionsEnabled",
   "optionalModules",
   "installId",
-  "users"
+  "users",
+  "engine"
 ]);
 
 // Multi-user (SpaceApp accounts with SPACE_MULTI_USER_ENABLED): every user's CLIs run in their own container, with
@@ -366,6 +377,12 @@ export function validateConfig(config) {
   }
   if (config.accessMode !== "isolated" && config.accessMode !== "host-root") {
     throw new Error("accessMode must be isolated or host-root.");
+  }
+  if (config.engine !== undefined && config.engine !== "docker" && config.engine !== "podman") {
+    throw new Error('engine must be "docker" or "podman".');
+  }
+  if (config.engine === "podman" && config.accessMode === "host-root") {
+    throw new Error(hostRootOnPodmanMessage());
   }
   if (typeof config.companionsEnabled !== "boolean") {
     throw new Error("companionsEnabled must be boolean.");
@@ -674,29 +691,32 @@ export async function userNamespacesUsable(platform = process.platform, read = (
 // mounts). Only where the sandbox can run: elsewhere it would widen the container for nothing.
 const CLI_SANDBOX_OPTIONS = ["    security_opt:", "      - seccomp=./seccomp-cli.json", "      - apparmor=unconfined"];
 
-export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
-  validateConfig(config);
-  const mounts = config.workspaces.flatMap((workspace) => [
+function bindMountLines(workspace, selinux) {
+  return [
     "      - type: bind",
     `        source: ${JSON.stringify(workspace.hostPath)}`,
     `        target: ${JSON.stringify(workspace.containerPath)}`,
-    `        read_only: ${workspace.readOnly}`
-  ]);
+    `        read_only: ${workspace.readOnly}`,
+    ...(selinux ? selinuxBindLines() : [])
+  ];
+}
+
+export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
+  validateConfig(config);
+  const podman = configEngine(config) === "podman";
+  // docker-compose inlines a seccomp file and Podman then treats that JSON as a filename.
+  const sandbox = cliSandbox && !podman;
+  const mounts = config.workspaces.flatMap((workspace) => bindMountLines(workspace, podman));
   const service = mounts.length > 0
     ? ["    volumes:", ...mounts]
     : ["    volumes: []"];
   if (config.users === undefined) {
-    return ["services:", "  spaceapp-core:", ...service, "  spaceapp-cli:", ...service, ...(cliSandbox ? CLI_SANDBOX_OPTIONS : []), ""].join("\n");
+    return ["services:", "  spaceapp-core:", ...service, "  spaceapp-cli:", ...service, ...(sandbox ? CLI_SANDBOX_OPTIONS : []), ""].join("\n");
   }
   // "user enable": accounts are on, and the core starts a USER's CLIs only in that user's own container.
   const users = config.users;
   const settings = profileRuntimeSettings(config.profile);
-  const bind = (workspace) => [
-    "      - type: bind",
-    `        source: ${JSON.stringify(workspace.hostPath)}`,
-    `        target: ${JSON.stringify(workspace.containerPath)}`,
-    `        read_only: ${workspace.readOnly}`
-  ];
+  const bind = (workspace) => bindMountLines(workspace, podman);
   const userServices = users.flatMap((user) => {
     const slug = userSlug(user.id);
     return [
@@ -705,9 +725,11 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
       "    image: ghcr.io/oll4com/spaceapp-cli:${SPACEAPP_IMAGE_TAG}${SPACEAPP_CLI_IMAGE_DIGEST:-}",
       "    restart: unless-stopped",
       "    init: true",
+      // Rootless Podman: start as root so gosu can drop to uid 10001, which keep-id maps to the host user.
+      ...(podman ? [`    user: "0:0"`, `    userns_mode: ${JSON.stringify(PODMAN_KEEP_ID)}`] : []),
       "    security_opt:",
       "      - no-new-privileges:true",
-      ...(cliSandbox ? CLI_SANDBOX_OPTIONS.slice(1) : []),
+      ...(sandbox ? CLI_SANDBOX_OPTIONS.slice(1) : []),
       `    mem_limit: "${user.memoryLimit ?? settings.cliMemoryLimit}"`,
       "    cpus: \"${SPACEAPP_CLI_CPU_LIMIT}\"",
       "    environment:",
@@ -719,7 +741,15 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
       `      - spaceapp-memory-${slug}:/var/lib/spaceapp/memory`,
       `      - spaceapp-cli-socket-${slug}:/run/spaceapp-cli`,
       `      - spaceapp-workspaces-${slug}:/workspaces`,
-      `      - ./secrets/users/${slug}/providers:/run/spaceapp-secrets/providers:ro`,
+      ...(podman
+        ? [
+          "      - type: bind",
+          `        source: "./secrets/users/${slug}/providers"`,
+          '        target: "/run/spaceapp-secrets/providers"',
+          "        read_only: true",
+          ...selinuxBindLines()
+        ]
+        : [`      - ./secrets/users/${slug}/providers:/run/spaceapp-secrets/providers:ro`]),
       ...user.workspaces.flatMap(bind),
       // Its own network: internet only, never the owner's internal services (temporal, companions) or other users.
       "    networks:",
@@ -738,7 +768,7 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
     ...users.map((user) => `      - spaceapp-cli-socket-${userSlug(user.id)}:/run/spaceapp-cli-users/${userSlug(user.id)}`),
     "  spaceapp-cli:",
     ...service,
-    ...(cliSandbox ? CLI_SANDBOX_OPTIONS : []),
+    ...(sandbox ? CLI_SANDBOX_OPTIONS : []),
     ...userServices,
     ...(users.length > 0 ? ["volumes:"] : []),
     ...users.flatMap((user) => ["cli-state", "memory", "cli-socket", "workspaces"].map((kind) => `  spaceapp-${kind}-${userSlug(user.id)}: {}`)),
@@ -790,6 +820,11 @@ export function composeCommand(action, root, options = {}) {
   validateHome(stateRoot);
   const profile = options.profile ?? "standard";
   const settings = profileRuntimeSettings(profile);
+  const engine = options.engine === "podman" ? "podman" : "docker";
+  // Container uid 0 under keep-id is a subordinate host id. Backup files must be written as 10001
+  // so they are owned by the host user. Restore still runs as container root: the entrypoint
+  // creates volume files before dropping privileges, and uid 10001 cannot rename those.
+  const backupUser = engine === "podman" ? PODMAN_APP_USER : "0:0";
   const base = [
     "compose",
     "--project-name", composeProjectName(root),
@@ -798,6 +833,7 @@ export function composeCommand(action, root, options = {}) {
     "-f", join(stateRoot, "compose.yml"),
     "-f", join(stateRoot, "compose.workspaces.yml"),
     "-f", join(stateRoot, "compose.host-access.yml"),
+    ...(engine === "podman" ? ["-f", join(stateRoot, "compose.podman.yml")] : []),
     ...(settings.browserEnabled ? ["--profile", "standard"] : []),
     ...(settings.temporalEnabled ? ["--profile", "workflows"] : []),
     ...(options.companionsEnabled ? ["--profile", "companions"] : [])
@@ -838,7 +874,10 @@ export function composeCommand(action, root, options = {}) {
     ],
     // The backup runs in a one-off container while the writers are paused (backupWithWritersPaused in cli.mjs).
     backup: [
-      "run", "--rm", "--no-deps", "--user", "0:0",
+      "run", "--rm", "--no-deps",
+      // Podman compose run attaches stdin. Without -T a non-foreground caller stops on SIGTTIN and never exits.
+      ...(engine === "podman" ? ["-T"] : []),
+      "--user", backupUser,
       "--env", "SPACE_DATABASE_URL_FILE=/run/secrets/database-url",
       "--entrypoint", "node", "spaceapp-core", "scripts/portable-backup.mjs"
     ],
@@ -890,6 +929,7 @@ export function composeCommand(action, root, options = {}) {
       "run",
       "--rm",
       "--no-deps",
+      ...(engine === "podman" ? ["-T"] : []),
       "--user",
       "0:0",
       "--env",
@@ -909,7 +949,7 @@ export function composeCommand(action, root, options = {}) {
   if (!selected) {
     throw new Error(`Unsupported Compose action "${action}".`);
   }
-  return { command: "docker", args: [...base, ...selected] };
+  return { command: engine, args: [...base, ...selected] };
 }
 
 export function composeProjectName(root) {
@@ -974,6 +1014,12 @@ export async function writeRuntimeFiles(root, config, imageLock = PACKAGE_IMAGE_
   }
   await atomicWrite(join(root, "runtime.env"), renderRuntimeEnv(config, imageLock, recorded));
   await atomicWrite(join(root, "compose.workspaces.yml"), renderWorkspaceCompose(config, { cliSandbox: await userNamespacesUsable() }));
+  const podmanCompose = join(root, "compose.podman.yml");
+  if (configEngine(config) === "podman") {
+    await atomicWrite(podmanCompose, renderPodmanRuntimeCompose());
+  } else {
+    await rm(podmanCompose, { force: true });
+  }
   // The core reads it as uid 10001 through a read-only bind mount.
   await atomicWrite(join(root, "cli-hosts.json"), renderCliHosts(config), 0o644);
   for (const user of config.users ?? []) await mkdir(providerSecretsRoot(root, user.id), { recursive: true, mode: 0o700 });
@@ -984,7 +1030,8 @@ export async function prepareInstallation(root, {
   version,
   profile,
   accessMode,
-  companionsEnabled
+  companionsEnabled,
+  engine
 }) {
   validateHome(root);
   await mkdir(root, { recursive: true, mode: 0o700 });
@@ -997,18 +1044,32 @@ export async function prepareInstallation(root, {
     ? undefined
     : resolveInstallProfile(profile, profile === "auto" ? await inspectSystemResources(root) : totalmem());
   let config;
+  let configLoaded = true;
   try {
     config = await loadConfig(root);
   } catch (error) {
     if (error?.code !== "ENOENT") {
       throw error;
     }
+    configLoaded = false;
     config = createDefaultConfig({
       version,
       profile: resolvedProfile ?? "light",
       accessMode: resolveInstallAccessMode(accessMode),
       companionsEnabled
     });
+  }
+  if (engine !== undefined) assertContainerEngine(engine);
+  const requestedEngine = engine ?? configEngine(config);
+  if (configLoaded && requestedEngine !== configEngine(config)) {
+    throw new Error(engineSwitchMessage(configEngine(config), requestedEngine));
+  }
+  const resolvedAccessMode = resolveInstallAccessMode(accessMode, config.accessMode);
+  if (requestedEngine === "podman" && resolvedAccessMode === "host-root") {
+    throw new Error(hostRootOnPodmanMessage());
+  }
+  if (requestedEngine === "podman") {
+    config = { ...config, engine: "podman" };
   }
   if (config.version !== version) {
     config = {
@@ -1020,7 +1081,6 @@ export async function prepareInstallation(root, {
   if (resolvedProfile !== undefined) {
     config = { ...config, profile: resolvedProfile };
   }
-  const resolvedAccessMode = resolveInstallAccessMode(accessMode, config.accessMode);
   if (config.accessMode !== resolvedAccessMode) {
     config = { ...config, accessMode: resolvedAccessMode };
   }
@@ -1093,11 +1153,32 @@ export async function commitInstallation(root, config, {
   validateConfig(config);
   const composeTemplate = await readFile(join(templateDir, "compose.yml"), "utf8");
   await mkdir(root, { recursive: true, mode: 0o700 });
-  await atomicWrite(join(root, "compose.yml"), composeTemplate);
+  await atomicWrite(
+    join(root, "compose.yml"),
+    configEngine(config) === "podman" ? applyPodmanHostMounts(composeTemplate) : composeTemplate
+  );
   await mkdir(projectRoot, { recursive: true, mode: 0o700 });
   await atomicWrite(join(projectRoot, "seccomp-cli.json"), await readFile(join(defaultTemplateDir(), "seccomp-cli.json"), "utf8"));
   await writeRuntimeFiles(root, config);
   if (persistConfig) await saveConfig(root, config);
+}
+
+export function applyPodmanHostMounts(template) {
+  const backups = "      - ./backups:/backups";
+  const secrets = "      - ./secrets/providers:/run/spaceapp-secrets/providers:ro";
+  if (!template.includes(backups) || !template.includes(secrets)) {
+    throw new Error("Compose template is missing the backups or provider-secrets bind mount.");
+  }
+  const longBind = (source, target, readOnly) => [
+    "      - type: bind",
+    `        source: ${JSON.stringify(source)}`,
+    `        target: ${JSON.stringify(target)}`,
+    `        read_only: ${readOnly}`,
+    ...selinuxBindLines()
+  ].join("\n");
+  return template
+    .replace(backups, longBind("./backups", "/backups", false))
+    .replace(secrets, longBind("./secrets/providers", "/run/spaceapp-secrets/providers", true));
 }
 
 export async function initializeInstallation(root, options) {

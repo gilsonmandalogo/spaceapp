@@ -57,3 +57,98 @@ jobs:
       - run: npm run check -w run-spaceapp
       - run: npm run pack:dry-run -w run-spaceapp
       - run: node packages/run-spaceapp/bin/spaceapp.mjs --version
+
+  podman-linux:
+    name: Launcher / rootless Podman / small
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.23.0"
+          cache: npm
+
+      # ubuntu-latest often ships Podman 4.9, whose crun is too old for this stack.
+      # Podman 5 with a matching crun and docker-compose v2 is the supported provider.
+      - name: Install Podman 5 and docker-compose v2
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y uidmap slirp4netns containernetworking-plugins curl
+          version="$(podman --version 2>/dev/null || true)"
+          major="$(printf '%s\n' "$version" | sed -n 's/.* \([0-9][0-9]*\)\..*/\1/p')"
+          if [ -z "${major:-}" ] || [ "$major" -lt 5 ]; then
+            curl -fsSL -o /tmp/podman.tgz https://github.com/mgoltzsche/podman-static/releases/download/v5.8.8/podman-linux-amd64.tar.gz
+            mkdir -p /tmp/podman-static
+            tar -xzf /tmp/podman.tgz -C /tmp/podman-static
+            sudo cp -a /tmp/podman-static/*/usr/local/. /usr/local/
+            if [ -d /tmp/podman-static/*/etc ]; then sudo cp -a /tmp/podman-static/*/etc/. /etc/; fi
+          fi
+          curl -fsSL -o /tmp/docker-compose "https://github.com/docker/compose/releases/download/v2.39.4/docker-compose-linux-x86_64"
+          sudo install -m 0755 /tmp/docker-compose /usr/local/bin/docker-compose
+          mkdir -p "$HOME/.docker/cli-plugins"
+          ln -sfn /usr/local/bin/docker-compose "$HOME/.docker/cli-plugins/docker-compose"
+          mkdir -p "$HOME/.config/containers"
+          crun_path="/usr/bin/crun"
+          if [ -x /usr/local/bin/crun ]; then crun_path=/usr/local/bin/crun; fi
+          cat > "$HOME/.config/containers/containers.conf" <<EOF
+          [engine]
+          runtime = "crun"
+          cgroup_manager = "cgroupfs"
+          events_logger = "file"
+
+          [engine.runtimes]
+          crun = ["${crun_path}"]
+          EOF
+          uid="$(id -u)"
+          export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
+          sudo mkdir -p "$XDG_RUNTIME_DIR"
+          sudo chown "${uid}:${uid}" "$XDG_RUNTIME_DIR"
+          sudo chmod 700 "$XDG_RUNTIME_DIR"
+          export PATH="/usr/local/bin:${PATH}"
+          podman --version
+          podman compose version
+          podman info --format json >/tmp/podman-info.json
+          python3 - <<'PY'
+          import json
+          info = json.load(open("/tmp/podman-info.json"))
+          host = info.get("host", {})
+          print("rootless", host.get("security", {}).get("rootless"), "cgroup", host.get("cgroupVersion"), "controllers", host.get("cgroupControllers"))
+          PY
+
+      - run: npm ci
+
+      - name: Install the small profile, back up, and purge
+        env:
+          PATH: /usr/local/bin:/usr/bin:/bin
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
+          export SPACEAPP_HOME="${RUNNER_TEMP}/spaceapp-podman"
+          launcher="node packages/run-spaceapp/bin/spaceapp.mjs"
+          "$launcher" install --engine podman --profile small --access isolated --no-open \
+            --non-interactive \
+            --answers '{"confirm":true,"profile":"small","access":"isolated","companions":false,"telemetry":false,"open":false}'
+          "$launcher" doctor
+          curl -fsS http://127.0.0.1:4911/readyz
+          "$launcher" backup
+          printf 'DELETE\n' | "$launcher" uninstall --purge-data
+          test -z "$(podman ps -aq)"
+          test -z "$(podman volume ls -q)"
+
+      - name: Show Podman diagnostics when the smoke test fails
+        if: failure()
+        env:
+          PATH: /usr/local/bin:/usr/bin:/bin
+        run: |
+          uid="$(id -u)"
+          export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
+          export SPACEAPP_HOME="${RUNNER_TEMP}/spaceapp-podman"
+          podman ps -a || true
+          podman volume ls || true
+          node packages/run-spaceapp/bin/spaceapp.mjs logs || true

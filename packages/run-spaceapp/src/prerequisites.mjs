@@ -5,11 +5,21 @@ import { tmpdir } from "node:os";
 import { join, posix, win32 } from "node:path";
 import process from "node:process";
 import { createInterface } from "node:readline/promises";
-import { Readable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { UNIVERSAL_INSTALL_COMMAND } from "./package-info.mjs";
+import { PROFILE_REQUIREMENTS } from "./index.mjs";
+import {
+  composeProviderSupported,
+  engineRuntimeChecks,
+  normalizeEngineInfo,
+  podmanApiServiceHelp,
+  podmanInstallHelp,
+  podmanMachineAssessment,
+  podmanVersionSupported
+} from "./engine.mjs";
 
 const DOCKER_TERMS_URL = "https://www.docker.com/legal/docker-subscription-service-agreement/";
 const DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1_000;
@@ -133,11 +143,18 @@ export async function ensureDockerAvailable({
   sleep = wait,
   osRelease,
   installArgs,
+  offerPodman = false,
   scheduleResume = scheduleWindowsInstallResume,
   confirmRestart = confirmWindowsRestart
 }) {
   if (await dockerIsReady(execute)) {
     return { code: 0, reexecuted: false };
+  }
+  if (offerPodman && platform !== "win32") {
+    const podman = await probePodman(execute);
+    if (podman.present) {
+      return { code: 0, reexecuted: false, useEngine: "podman", podmanReady: podman.ready, facts: podman.facts };
+    }
   }
   if (platform === "win32") {
     return ensureWindowsDocker({
@@ -1184,3 +1201,133 @@ function launchDetachedCommand(spec) {
 function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
+
+async function captureCommand(execute, spec) {
+  let output = "";
+  const stdout = new Writable({
+    write(chunk, _encoding, done) {
+      if (output.length < 1024 * 1024) output += chunk.toString();
+      done();
+    }
+  });
+  let code;
+  try {
+    code = await execute(spec, { stdout, stderr: null });
+  } catch (error) {
+    if (error?.code === "ENOENT") return { code: 127, output: "" };
+    throw error;
+  }
+  return { code, output: output.trim() };
+}
+
+async function probePodman(execute) {
+  const version = await captureCommand(execute, { command: "podman", args: ["--version"] });
+  const versionText = /podman version\s+\d+\.\d+\.\d+/i.test(version.output) ? version.output : "";
+  if (version.code !== 0 || !versionText) return { present: false, ready: false, facts: null };
+  const compose = await captureCommand(execute, { command: "podman", args: ["compose", "version"] });
+  const info = await captureCommand(execute, { command: "podman", args: ["info", "--format", "json"] });
+  let facts = null;
+  try {
+    facts = normalizeEngineInfo("podman", JSON.parse(info.output));
+  } catch {
+    facts = null;
+  }
+  const ready = podmanVersionSupported(version.output)
+    && compose.code === 0
+    && composeProviderSupported(compose.output)
+    && Boolean(facts);
+  return { present: true, ready, facts, version: version.output, compose: compose.output };
+}
+
+// Docker stays the default whenever it answers. Podman is offered only when Docker is absent
+// and `podman --version` actually prints a version. A zero exit with empty output is not Podman.
+export async function detectInstallEngine({ platform = process.platform, execute, requestedEngine } = {}) {
+  if (requestedEngine !== undefined && requestedEngine !== "docker" && requestedEngine !== "podman") {
+    return { ok: false, message: 'Container engine must be "docker" or "podman".' };
+  }
+  if (requestedEngine === "podman" && platform === "win32") {
+    return { ok: false, message: podmanInstallHelp("win32") };
+  }
+  if (requestedEngine) return { ok: true, engine: requestedEngine, explicit: true };
+  if (await dockerIsReady(execute)) return { ok: true, engine: "docker" };
+  const podman = await probePodman(execute);
+  if (podman.present) return { ok: true, engine: null, podmanAvailable: true, facts: podman.facts };
+  return { ok: true, engine: "docker" };
+}
+
+export async function ensurePodmanAvailable({
+  platform = process.platform,
+  stdout,
+  stderr,
+  execute,
+  sleep = wait,
+  profile,
+  installArgs = {}
+} = {}) {
+  if (platform === "win32") {
+    stderr.write(`${podmanInstallHelp("win32")}\n`);
+    return { code: 1, reexecuted: false };
+  }
+  const probed = await probePodman(execute);
+  if (!probed.present || !podmanVersionSupported(probed.version)) {
+    stderr.write(`${podmanInstallHelp(platform)}\n`);
+    if (probed.present) stderr.write(`Podman ${MIN_PODMAN_LINE} or newer is required. Found: ${probed.version}\n`);
+    return { code: 1, facts: probed.facts, reexecuted: false };
+  }
+  if (!composeProviderSupported(probed.compose)) {
+    stderr.write(
+      "SpaceApp needs `podman compose` backed by docker-compose v2. " +
+      "The Python podman-compose 1.x provider is not supported.\n" +
+      `${podmanInstallHelp(platform)}\n`
+    );
+    return { code: 1, facts: probed.facts, reexecuted: false };
+  }
+  if (!probed.facts) {
+    stderr.write(`podman info --format json did not return engine facts.\n${podmanInstallHelp(platform)}\n`);
+    return { code: 1, reexecuted: false };
+  }
+  const runtime = engineRuntimeChecks(probed.facts, { platform });
+  const failed = runtime.filter((check) => !check.ok);
+  if (failed.length > 0) {
+    for (const check of failed) stderr.write(`FAIL ${check.name}: ${check.detail}\n`);
+    return { code: 1, facts: probed.facts, reexecuted: false };
+  }
+  const machineProfile = PROFILE_REQUIREMENTS[profile] ? profile : installArgs.requestedProfile;
+  if (platform === "darwin" && PROFILE_REQUIREMENTS[machineProfile]) {
+    const inspected = await captureCommand(execute, { command: "podman", args: ["machine", "inspect", "--format", "json"] });
+    const assessment = podmanMachineAssessment(inspected.code === 0 ? inspected.output : "", PROFILE_REQUIREMENTS[machineProfile]);
+    if (!assessment.ok) {
+      stderr.write(`${assessment.issues.join("\n")}\n`);
+      return { code: 1, facts: probed.facts, reexecuted: false };
+    }
+  }
+  const service = await ensurePodmanApiService(execute, { stdout, stderr, sleep });
+  if (service !== 0) return { code: service, facts: probed.facts, reexecuted: false };
+  return { code: 0, facts: probed.facts, reexecuted: false };
+}
+
+async function ensurePodmanApiService(execute, { stdout, stderr, sleep }) {
+  if (await execute({ command: "podman", args: ["compose", "ls"] }, { stdout: null, stderr: null }) === 0) return 0;
+  stdout?.write("Starting the Podman API service so docker-compose can connect...\n");
+  const started = await execute(
+    { command: "podman", args: ["system", "service", "--time=0"], background: true },
+    { stdout: null, stderr: null }
+  );
+  if (started !== 0) {
+    stderr.write(`${podmanApiServiceHelp()}\n`);
+    return started || 1;
+  }
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    if (await execute({ command: "podman", args: ["compose", "ls"] }, { stdout: null, stderr: null }) === 0) return 0;
+    await sleep(500);
+  }
+  stderr.write(`${podmanApiServiceHelp()}\n`);
+  return 1;
+}
+
+export async function ensureEngineAvailable(options = {}) {
+  if (options.engine === "podman") return ensurePodmanAvailable(options);
+  return ensureDockerAvailable(options);
+}
+
+const MIN_PODMAN_LINE = "5";

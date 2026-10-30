@@ -40,6 +40,39 @@ work: during image pulls the launcher switches Docker to a temporary
 credential-free config so Docker Desktop's graphical credential helper is never
 invoked outside an interactive logon.
 
+### Podman
+
+`install --engine podman` selects Podman and stores that choice for every
+later command (`up`, `status`, `logs`, `down`, `update`, `rollback`, `backup`,
+`restore`, `doctor`, `uninstall`). Supported setup: Podman 5 or newer and
+`podman compose` backed by docker-compose v2. podman-compose 1.x is not
+supported. The launcher does not install Podman. On Linux it requires rootless
+mode, cgroup v2, and delegated cpu and memory controllers, and it says so
+before `up` when a limit cannot be applied. On macOS it checks the Podman
+machine's CPU, memory, and disk against the profile and prints the resize
+command. `--access host-root` is refused. Switching an existing installation
+from Docker to Podman (or the other way) is refused because the volumes are
+not visible across engines; use `backup`, `uninstall --purge-data`,
+`install --engine <engine>`, and `restore`.
+
+Rootless containers start as root inside a `keep-id` user namespace so the
+published entrypoint can drop to uid 10001, which is your host user. The
+Docker CLI seccomp profile is not applied on Podman: docker-compose inlines
+that file and Podman then tries to open the JSON as a path. Podman schedules
+healthchecks with systemd timers. Builds compiled without that support,
+including the static Podman bundle on GitHub-hosted Ubuntu, never leave
+`starting`, so `depends_on` health conditions would wait forever. While `up`
+is running, the launcher calls `podman healthcheck run` for those containers.
+Backup runs as uid 10001, so files under `./backups` stay yours. Restore runs
+as container root, because the entrypoint creates volume files before it drops
+privileges and uid 10001 cannot rename those.
+`docker compose unpause` against the Podman API reports success and leaves
+containers paused, so backup resumes writers with `podman unpause`.
+Backup and restore `run` containers use `-T` so Podman does not attach stdin.
+`doctor` and `support-bundle` report the engine, version, rootless or rootful
+mode, cgroup version, and whether CPU and memory limits are delegated.
+The bundle does not include secrets.
+
 The launcher selects `small`, `medium`, or `large` automatically using CPU,
 RAM and free disk. Docker's CPU and RAM allocation is checked as well.
 
